@@ -1,0 +1,18 @@
+[package]
+name = "vr-island"
+version = "0.1.0"
+description = "A privacy-minded Windows island"
+authors = ["VR DEVELOPMENTS"]
+edition = "2021"
+
+[lib]
+name = "vr_island_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
