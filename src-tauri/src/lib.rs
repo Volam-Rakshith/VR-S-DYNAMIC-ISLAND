@@ -1,14 +1,15 @@
+mod system;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, menu::{Menu, MenuItem}, tray::TrayIconBuilder};
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Settings { theme: String, accent: String, show_seconds: bool, animation_ms: u16 }
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+struct Settings { theme: String, accent: String, show_seconds: bool, animation_ms: u16, animation: String, position: String, compact_width: u16, compact_height: u16 }
 impl Default for Settings {
- fn default() -> Self { Self { theme: "dark".into(), accent: "#a4f5c8".into(), show_seconds: false, animation_ms: 240 } }
+ fn default() -> Self { Self { theme: "dark".into(), accent: "#a4f5c8".into(), show_seconds: false, animation_ms: 240, animation: "scale".into(), position: "top-center".into(), compact_width: 260, compact_height: 52 } }
 }
 impl Settings {
- fn valid(&self) -> bool { ["dark", "light", "black"].contains(&self.theme.as_str()) && self.accent.len() == 7 && self.accent.starts_with('#') && self.accent[1..].bytes().all(|b| b.is_ascii_hexdigit()) && self.animation_ms <= 1000 }
+ fn valid(&self) -> bool { ["dark", "light", "black", "midnight", "ocean", "forest", "lavender", "rose", "sunset", "slate", "sand", "mint", "contrast", "glass", "neo"].contains(&self.theme.as_str()) && self.accent.len() == 7 && self.accent.starts_with('#') && self.accent[1..].bytes().all(|b| b.is_ascii_hexdigit()) && self.animation_ms <= 1000 && ["fade", "scale", "slide-down", "slide-up", "slide-left", "slide-right", "bounce", "soft-pop", "flip", "blur", "zoom-out", "rotate", "swing", "stretch", "none"].contains(&self.animation.as_str()) && ["top-center", "top-left", "top-right", "bottom-center", "bottom-left", "bottom-right"].contains(&self.position.as_str()) && (240..=400).contains(&self.compact_width) && (48..=80).contains(&self.compact_height) }
 }
 #[tauri::command]
 fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
@@ -22,8 +23,23 @@ fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String
  std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
  std::fs::write(dir.join("settings.json"), serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
+#[tauri::command]
+fn apply_layout(window: tauri::WebviewWindow, settings: Settings, expanded: bool) -> Result<(), String> {
+ if !settings.valid() { return Err("Invalid layout settings".into()); }
+ let monitor = window.current_monitor().map_err(|e| e.to_string())?.ok_or("No monitor available")?;
+ let scale = monitor.scale_factor();
+ let (width, height) = if expanded { (420_u32, 520_u32) } else { (settings.compact_width as u32, settings.compact_height as u32) };
+ window.set_size(tauri::LogicalSize::new(width, height)).map_err(|e| e.to_string())?;
+ let area = monitor.work_area();
+ let w = (width as f64 * scale).round() as i32;
+ let h = (height as f64 * scale).round() as i32;
+ let margin = (12.0 * scale).round() as i32;
+ let x = if settings.position.ends_with("left") { area.position.x + margin } else if settings.position.ends_with("right") { area.position.x + area.size.width as i32 - w - margin } else { area.position.x + (area.size.width as i32 - w) / 2 };
+ let y = if settings.position.starts_with("bottom") { area.position.y + area.size.height as i32 - h - margin } else { area.position.y + margin };
+ window.set_position(tauri::PhysicalPosition::new(x, y)).map_err(|e| e.to_string())
+}
 pub fn run() {
- tauri::Builder::default().invoke_handler(tauri::generate_handler![load_settings, save_settings]).setup(|app| {
+ tauri::Builder::default().invoke_handler(tauri::generate_handler![load_settings, save_settings, apply_layout, system::get_system_status]).setup(|app| {
   let show = MenuItem::with_id(app, "show", "Show Island", true, None::<&str>)?;
   let hide = MenuItem::with_id(app, "hide", "Hide Island", true, None::<&str>)?;
   let settings = MenuItem::with_id(app, "settings", "Open Settings", true, None::<&str>)?;
