@@ -45,24 +45,46 @@ pub fn get_system_status(include_power: bool, include_network: bool) -> Result<S
 #[link(name = "winmm")]
 extern "system" { fn PlaySoundW(sound: *const u16, module: *mut std::ffi::c_void, flags: u32) -> i32; }
 
-#[tauri::command]
-pub fn play_timer_sound(sound: String) -> Result<(), String> {
-    let wave: &'static [u8] = match sound.as_str() {
-        "silent" => return Ok(()),
-        "default" => include_bytes!("../assets/timer-default.wav"),
-        "information" => include_bytes!("../assets/timer-information.wav"),
-        "warning" => include_bytes!("../assets/timer-warning.wav"),
-        _ => return Err("Unsupported alarm sound".into()),
-    };
+#[cfg(windows)]
+fn sound_data(sound: &str) -> Result<Option<(&'static str, &'static [u8])>, String> {
+    match sound {
+        "silent" => Ok(None),
+        "default" => Ok(Some(("soft.wav", include_bytes!("../assets/timer-default.wav")))),
+        "information" => Ok(Some(("chime.wav", include_bytes!("../assets/timer-information.wav")))),
+        "warning" => Ok(Some(("bright.wav", include_bytes!("../assets/timer-warning.wav")))),
+        "community" => Ok(Some(("community.wav", include_bytes!("../assets/timer-community.wav")))),
+        _ => Err("Unsupported alarm sound".into()),
+    }
+}
+
+pub fn start_sound(app: &tauri::AppHandle, sound: &str, looping: bool) -> Result<(), String> {
     #[cfg(windows)] {
-        // Static embedded WAV remains valid while asynchronous playback runs.
-        const SND_ASYNC: u32 = 1; const SND_NODEFAULT: u32 = 2; const SND_MEMORY: u32 = 4;
-        if unsafe { PlaySoundW(wave.as_ptr().cast(), std::ptr::null_mut(), SND_ASYNC | SND_NODEFAULT | SND_MEMORY) } == 0 {
-            return Err("Windows could not play the timer sound; check the output device and system volume".into());
+        use std::os::windows::ffi::OsStrExt;
+        use tauri::Manager;
+        let Some((name, data)) = sound_data(sound)? else { return Ok(()) };
+        let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("alarm-sounds");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(name);
+        // Built-in fixed file names only; no untrusted input or uploads.
+        std::fs::write(&path, data).map_err(|e| e.to_string())?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        const SND_ASYNC: u32 = 1; const SND_NODEFAULT: u32 = 2; const SND_LOOP: u32 = 8; const SND_FILENAME: u32 = 0x20000;
+        let flags = SND_ASYNC | SND_NODEFAULT | SND_FILENAME | if looping { SND_LOOP } else { 0 };
+        if unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), flags) } == 0 {
+            return Err("Windows could not start the alarm. Check the output device and volume mixer.".into());
         }
         Ok(())
     }
-    #[cfg(not(windows))] { let _ = wave; Err("Windows is required".into()) }
+    #[cfg(not(windows))] { let _ = (app, sound, looping); Err("Windows is required".into()) }
+}
+
+pub fn stop_sound() {
+    #[cfg(windows)] unsafe { PlaySoundW(std::ptr::null(), std::ptr::null_mut(), 0); }
+}
+
+#[tauri::command]
+pub fn play_timer_sound(app: tauri::AppHandle, sound: String) -> Result<(), String> {
+    start_sound(&app, &sound, false)
 }
 
 #[derive(Serialize)]

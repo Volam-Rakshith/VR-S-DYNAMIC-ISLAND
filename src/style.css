@@ -48,3 +48,7 @@
 @keyframes vr-pill-to-content{0%,20%{opacity:1}45%,100%{opacity:0}}
 @keyframes vr-content-to-pill{0%,55%{opacity:0}100%{opacity:1}}
 .timer-edit{width:155px;max-width:55%;padding:0;border:0;border-bottom:1px dashed var(--muted);border-radius:0;background:transparent;color:var(--text);outline-offset:2px}.timer-hint{display:flex;align-items:center;justify-content:space-between;margin-top:9px;color:var(--muted);font-size:10px}.timer-hint button{border:1px solid var(--line);background:var(--bg);color:var(--text);border-radius:7px;padding:5px 8px;font-size:10px}.compact-snooze{width:56px;min-width:0;padding:3px 1px;font-size:9px}.expanded-alert select{font-size:10px;padding:4px}.card,.settings-card,.extra-timers{background:color-mix(in srgb,var(--surface) var(--opacity,100%),transparent)}
+/* The transparency slider affects only the compact pill, never expanded content. */
+.panel{background:var(--bg)}.card,.settings-card,.extra-timers{background:var(--surface)}
+.shell.glass{--bg:#172033}
+.sound-preview:disabled{opacity:.4;cursor:not-allowed}

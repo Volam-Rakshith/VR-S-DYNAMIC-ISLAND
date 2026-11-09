@@ -53,26 +53,45 @@ pub async fn media_action(source: String, action: String) -> Result<(), String> 
     #[cfg(not(windows))] { let _ = (source, action); Err("Windows is required".into()) }
 }
 
-// Only one alarm sound sequence runs at a time. Other completed timers remain
-// in the frontend's alert queue; they must not race to resume playback.
-static ALARM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-struct AlarmGuard;
-impl Drop for AlarmGuard {
-    fn drop(&mut self) { ALARM_ACTIVE.store(false, std::sync::atomic::Ordering::Release); }
+// State is shared across start and dismiss commands. A generation number lets
+// dismissal cancel a start while a slow media app is still responding.
+#[cfg(windows)]
+struct PausedSession { session: windows::Media::Control::GlobalSystemMediaTransportControlsSession, source: String, title: String }
+#[derive(Default)]
+pub struct AlarmController { inner: std::sync::Mutex<AlarmState> }
+#[derive(Default)]
+struct AlarmState { generation: u64, active: bool, #[cfg(windows)] paused: Option<PausedSession> }
+
+#[cfg(windows)]
+async fn resume_if_unchanged(paused: PausedSession) {
+    use windows::Media::Control::{GlobalSystemMediaTransportControlsSessionManager as Manager, GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status};
+    let mut same = false;
+    if let Ok(op) = Manager::RequestAsync() {
+        if let Ok(manager) = op.await {
+            if let Ok(current) = manager.GetCurrentSession() {
+                if current.SourceAppUserModelId().map(|v| v.to_string() == paused.source).unwrap_or(false) {
+                    if let Ok(op) = current.TryGetMediaPropertiesAsync() {
+                        if let Ok(props) = op.await { same = props.Title().map(|v| v.to_string() == paused.title).unwrap_or(false); }
+                    }
+                }
+            }
+        }
+    }
+    let is_paused = paused.session.GetPlaybackInfo().and_then(|p| p.PlaybackStatus()).map(|v| v == Status::Paused).unwrap_or(false);
+    if same && is_paused { if let Ok(op) = paused.session.TryPlayAsync() { let _ = op.await; } }
 }
 
-/// Briefly pauses the current playing session, sounds the local alarm, and
-/// attempts to resume only the same still-paused track. A player can refuse a
-/// command, disappear, or change tracks; in these cases sound still plays.
 #[tauri::command]
-pub async fn play_timer_alarm(sound: String) -> Result<(), String> {
+pub async fn play_timer_alarm(app: tauri::AppHandle, controller: tauri::State<'_, AlarmController>, sound: String) -> Result<(), String> {
     if sound == "silent" { return Ok(()); }
-    if ALARM_ACTIVE.compare_exchange(false, true, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed).is_err() { return Ok(()); }
-    let _guard = AlarmGuard;
+    let generation = {
+        let mut state = controller.inner.lock().map_err(|_| "Alarm state unavailable")?;
+        if state.active { return Ok(()); }
+        state.generation = state.generation.wrapping_add(1); state.active = true; state.generation
+    };
     #[cfg(windows)] {
         use windows::Media::Control::{GlobalSystemMediaTransportControlsSessionManager as Manager, GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status};
-        // Failure to access media never prevents the alarm from sounding.
-        let mut paused: Option<(windows::Media::Control::GlobalSystemMediaTransportControlsSession, String, String)> = None;
+        let mut paused = None;
         if let Ok(op) = Manager::RequestAsync() {
             if let Ok(manager) = op.await {
                 if let Ok(session) = manager.GetCurrentSession() {
@@ -80,47 +99,46 @@ pub async fn play_timer_alarm(sound: String) -> Result<(), String> {
                     let eligible = info.as_ref().ok().and_then(|i| i.PlaybackStatus().ok()).map(|s| s == Status::Playing).unwrap_or(false)
                         && info.as_ref().ok().and_then(|i| i.Controls().ok()).map(|c| c.IsPauseEnabled().unwrap_or(false) && c.IsPlayEnabled().unwrap_or(false)).unwrap_or(false);
                     if eligible {
-                        if let (Ok(source), Ok(properties_op)) = (session.SourceAppUserModelId(), session.TryGetMediaPropertiesAsync()) {
-                            if let Ok(properties) = properties_op.await {
-                                if let Ok(title) = properties.Title() {
-                                    if let Ok(pause_op) = session.TryPauseAsync() {
-                                        if pause_op.await.unwrap_or(false) { paused = Some((session, source.to_string(), title.to_string())); }
-                                    }
-                                }
-                            }
+                        if let (Ok(source), Ok(op)) = (session.SourceAppUserModelId(), session.TryGetMediaPropertiesAsync()) {
+                            if let Ok(props) = op.await { if let Ok(title) = props.Title() { if let Ok(op) = session.TryPauseAsync() {
+                                if op.await.unwrap_or(false) { paused = Some(PausedSession { session, source: source.to_string(), title: title.to_string() }); }
+                            } } }
                         }
                     }
                 }
             }
         }
-        let sound_result = crate::system::play_timer_sound(sound);
-        // Embedded tones last 380 ms. Give the Windows mixer time to finish.
-        if sound_result.is_ok() {
-            let _ = tauri::async_runtime::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(550))).await;
-        }
-        if let Some((session, original_source, original_title)) = paused {
-            // Confirm that Windows still considers the same player/track active,
-            // and do not override a player that has already resumed or stopped.
-            let mut still_current = false;
-            if let Ok(op) = Manager::RequestAsync() {
-                if let Ok(manager) = op.await {
-                    if let Ok(current) = manager.GetCurrentSession() {
-                        if current.SourceAppUserModelId().map(|v| v.to_string() == original_source).unwrap_or(false) {
-                            if let Ok(props_op) = current.TryGetMediaPropertiesAsync() {
-                                if let Ok(props) = props_op.await {
-                                    still_current = props.Title().map(|v| v.to_string() == original_title).unwrap_or(false);
-                                }
-                            }
-                        }
-                    }
+        // No await while holding the lock. If dismissed during a slow pause,
+        // immediately restore the player instead of starting a late alarm.
+        let (cancelled, failed) = {
+            let mut state = controller.inner.lock().map_err(|_| "Alarm state unavailable")?;
+            if !state.active || state.generation != generation { (true, None) }
+            else {
+                state.paused = paused.take();
+                match crate::system::start_sound(&app, &sound, true) {
+                    Ok(()) => (false, None),
+                    Err(e) => { state.active = false; paused = state.paused.take(); (false, Some(e)) }
                 }
             }
-            let still_paused = session.GetPlaybackInfo().and_then(|v| v.PlaybackStatus()).map(|v| v == Status::Paused).unwrap_or(false);
-            if still_current && still_paused {
-                if let Ok(op) = session.TryPlayAsync() { let _ = op.await; }
-            }
-        }
-        sound_result
+        };
+        if let Some(session) = paused { resume_if_unchanged(session).await; }
+        if cancelled { return Ok(()); }
+        if let Some(error) = failed { return Err(error); }
+        Ok(())
     }
-    #[cfg(not(windows))] { let _ = sound; Err("Windows is required".into()) }
+    #[cfg(not(windows))] { let _ = (app, sound, generation); Err("Windows is required".into()) }
+}
+
+#[tauri::command]
+pub async fn stop_timer_alarm(controller: tauri::State<'_, AlarmController>) -> Result<(), String> {
+    #[cfg(windows)] {
+        let paused = {
+            let mut state = controller.inner.lock().map_err(|_| "Alarm state unavailable")?;
+            state.active = false; state.generation = state.generation.wrapping_add(1);
+            crate::system::stop_sound(); state.paused.take()
+        };
+        if let Some(session) = paused { resume_if_unchanged(session).await; }
+        Ok(())
+    }
+    #[cfg(not(windows))] { let _ = controller; Err("Windows is required".into()) }
 }
