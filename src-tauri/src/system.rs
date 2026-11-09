@@ -42,23 +42,27 @@ pub fn get_system_status(include_power: bool, include_network: bool) -> Result<S
 }
 
 #[cfg(windows)]
-#[link(name = "user32")]
-extern "system" { fn MessageBeep(kind: u32) -> i32; }
+#[link(name = "winmm")]
+extern "system" { fn PlaySoundW(sound: *const u16, module: *mut std::ffi::c_void, flags: u32) -> i32; }
 
 #[tauri::command]
 pub fn play_timer_sound(sound: String) -> Result<(), String> {
-    let kind = match sound.as_str() {
+    let wave: &'static [u8] = match sound.as_str() {
         "silent" => return Ok(()),
-        "default" => 0x00000000,
-        "information" => 0x00000040,
-        "warning" => 0x00000030,
+        "default" => include_bytes!("../assets/timer-default.wav"),
+        "information" => include_bytes!("../assets/timer-information.wav"),
+        "warning" => include_bytes!("../assets/timer-warning.wav"),
         _ => return Err("Unsupported alarm sound".into()),
     };
     #[cfg(windows)] {
-        if unsafe { MessageBeep(kind) } == 0 { return Err("Windows could not play the selected sound".into()); }
+        // Static embedded WAV remains valid while asynchronous playback runs.
+        const SND_ASYNC: u32 = 1; const SND_NODEFAULT: u32 = 2; const SND_MEMORY: u32 = 4;
+        if unsafe { PlaySoundW(wave.as_ptr().cast(), std::ptr::null_mut(), SND_ASYNC | SND_NODEFAULT | SND_MEMORY) } == 0 {
+            return Err("Windows could not play the timer sound; check the output device and system volume".into());
+        }
         Ok(())
     }
-    #[cfg(not(windows))] { let _ = kind; Err("Windows is required".into()) }
+    #[cfg(not(windows))] { let _ = wave; Err("Windows is required".into()) }
 }
 
 #[derive(Serialize)]

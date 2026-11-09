@@ -52,3 +52,75 @@ pub async fn media_action(source: String, action: String) -> Result<(), String> 
     }
     #[cfg(not(windows))] { let _ = (source, action); Err("Windows is required".into()) }
 }
+
+// Only one alarm sound sequence runs at a time. Other completed timers remain
+// in the frontend's alert queue; they must not race to resume playback.
+static ALARM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct AlarmGuard;
+impl Drop for AlarmGuard {
+    fn drop(&mut self) { ALARM_ACTIVE.store(false, std::sync::atomic::Ordering::Release); }
+}
+
+/// Briefly pauses the current playing session, sounds the local alarm, and
+/// attempts to resume only the same still-paused track. A player can refuse a
+/// command, disappear, or change tracks; in these cases sound still plays.
+#[tauri::command]
+pub async fn play_timer_alarm(sound: String) -> Result<(), String> {
+    if sound == "silent" { return Ok(()); }
+    if ALARM_ACTIVE.compare_exchange(false, true, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed).is_err() { return Ok(()); }
+    let _guard = AlarmGuard;
+    #[cfg(windows)] {
+        use windows::Media::Control::{GlobalSystemMediaTransportControlsSessionManager as Manager, GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status};
+        // Failure to access media never prevents the alarm from sounding.
+        let mut paused: Option<(windows::Media::Control::GlobalSystemMediaTransportControlsSession, String, String)> = None;
+        if let Ok(op) = Manager::RequestAsync() {
+            if let Ok(manager) = op.await {
+                if let Ok(session) = manager.GetCurrentSession() {
+                    let info = session.GetPlaybackInfo();
+                    let eligible = info.as_ref().ok().and_then(|i| i.PlaybackStatus().ok()).map(|s| s == Status::Playing).unwrap_or(false)
+                        && info.as_ref().ok().and_then(|i| i.Controls().ok()).map(|c| c.IsPauseEnabled().unwrap_or(false) && c.IsPlayEnabled().unwrap_or(false)).unwrap_or(false);
+                    if eligible {
+                        if let (Ok(source), Ok(properties_op)) = (session.SourceAppUserModelId(), session.TryGetMediaPropertiesAsync()) {
+                            if let Ok(properties) = properties_op.await {
+                                if let Ok(title) = properties.Title() {
+                                    if let Ok(pause_op) = session.TryPauseAsync() {
+                                        if pause_op.await.unwrap_or(false) { paused = Some((session, source.to_string(), title.to_string())); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let sound_result = crate::system::play_timer_sound(sound);
+        // Embedded tones last 380 ms. Give the Windows mixer time to finish.
+        if sound_result.is_ok() {
+            let _ = tauri::async_runtime::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(550))).await;
+        }
+        if let Some((session, original_source, original_title)) = paused {
+            // Confirm that Windows still considers the same player/track active,
+            // and do not override a player that has already resumed or stopped.
+            let mut still_current = false;
+            if let Ok(op) = Manager::RequestAsync() {
+                if let Ok(manager) = op.await {
+                    if let Ok(current) = manager.GetCurrentSession() {
+                        if current.SourceAppUserModelId().map(|v| v.to_string() == original_source).unwrap_or(false) {
+                            if let Ok(props_op) = current.TryGetMediaPropertiesAsync() {
+                                if let Ok(props) = props_op.await {
+                                    still_current = props.Title().map(|v| v.to_string() == original_title).unwrap_or(false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let still_paused = session.GetPlaybackInfo().and_then(|v| v.PlaybackStatus()).map(|v| v == Status::Paused).unwrap_or(false);
+            if still_current && still_paused {
+                if let Ok(op) = session.TryPlayAsync() { let _ = op.await; }
+            }
+        }
+        sound_result
+    }
+    #[cfg(not(windows))] { let _ = sound; Err("Windows is required".into()) }
+}
