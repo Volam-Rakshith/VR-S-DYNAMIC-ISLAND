@@ -10,10 +10,13 @@ fn with_endpoint<T>(f: impl FnOnce(&windows::Win32::Media::Audio::Endpoints::IAu
     use windows::Win32::{Media::Audio::{Endpoints::IAudioEndpointVolume, eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator}, System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED}};
     // Every successful CoInitializeEx, including S_FALSE, must be balanced on this thread.
     let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    initialized.ok().map_err(|e| e.to_string())?;
-    struct ComGuard;
-    impl Drop for ComGuard { fn drop(&mut self) { unsafe { CoUninitialize() } } }
-    let _guard = ComGuard;
+    // UI threads may already be initialized as STA. RPC_E_CHANGED_MODE means
+    // COM is usable in the existing apartment; do not uninitialize that setup.
+    let owns_init = initialized.is_ok();
+    if !owns_init && initialized.0 as u32 != 0x80010106 { return Err(initialized.to_string()); }
+    struct ComGuard(bool);
+    impl Drop for ComGuard { fn drop(&mut self) { if self.0 { unsafe { CoUninitialize() } } } }
+    let _guard = ComGuard(owns_init);
     unsafe {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).map_err(|e| e.to_string())?;

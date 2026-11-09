@@ -40,3 +40,45 @@ pub fn get_system_status(include_power: bool, include_network: bool) -> Result<S
     }
     #[cfg(not(windows))] { let _ = (include_power, include_network); Err("Windows is required".into()) }
 }
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" { fn MessageBeep(kind: u32) -> i32; }
+
+#[tauri::command]
+pub fn play_timer_sound(sound: String) -> Result<(), String> {
+    let kind = match sound.as_str() {
+        "silent" => return Ok(()),
+        "default" => 0x00000000,
+        "information" => 0x00000040,
+        "warning" => 0x00000030,
+        _ => return Err("Unsupported alarm sound".into()),
+    };
+    #[cfg(windows)] {
+        if unsafe { MessageBeep(kind) } == 0 { return Err("Windows could not play the selected sound".into()); }
+        Ok(())
+    }
+    #[cfg(not(windows))] { let _ = kind; Err("Windows is required".into()) }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkDetails { kind: String, connectivity: String, wifi_name: Option<String> }
+
+#[tauri::command]
+pub fn get_network_details(include_wifi_name: bool) -> Result<NetworkDetails, String> {
+    #[cfg(windows)] {
+        use windows::Networking::Connectivity::{NetworkInformation, NetworkConnectivityLevel};
+        let profile = NetworkInformation::GetInternetConnectionProfile().map_err(|_| "No preferred connection available".to_string())?;
+        let wifi = profile.IsWlanConnectionProfile().map_err(|e| e.to_string())?;
+        let level = profile.GetNetworkConnectivityLevel().map_err(|e| e.to_string())?;
+        let connectivity = if level == NetworkConnectivityLevel::InternetAccess { "Internet access reported" }
+            else if level == NetworkConnectivityLevel::LocalAccess { "Local network only" }
+            else if level == NetworkConnectivityLevel::ConstrainedInternetAccess { "Limited Internet access" }
+            else { "No connection reported" };
+        // The user must opt in to display the SSID. We never store or transmit it.
+        let wifi_name = if wifi && include_wifi_name { profile.WlanConnectionProfileDetails().ok().and_then(|w| w.GetConnectedSsid().ok()).map(|s| s.to_string()).filter(|s| !s.is_empty()) } else { None };
+        Ok(NetworkDetails { kind: if wifi { "Wi-Fi" } else { "Network" }.into(), connectivity: connectivity.into(), wifi_name })
+    }
+    #[cfg(not(windows))] { let _ = include_wifi_name; Err("Windows is required".into()) }
+}
