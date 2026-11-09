@@ -20,19 +20,23 @@ extern "system" { fn GetSystemPowerStatus(status: *mut PowerStatus) -> i32; }
 extern "system" { fn InternetGetConnectedState(flags: *mut u32, reserved: u32) -> i32; }
 
 #[tauri::command]
-pub fn get_system_status() -> Result<SystemStatus, String> {
+pub fn get_system_status(include_power: bool, include_network: bool) -> Result<SystemStatus, String> {
     #[cfg(windows)] {
-        let mut p = PowerStatus { ac: 255, flags: 255, percent: 255, saver: 0, remaining: u32::MAX, full: u32::MAX };
-        // GetSystemPowerStatus fills the supplied buffer; a zero result is failure.
-        if unsafe { GetSystemPowerStatus(&mut p) } == 0 { return Err("Windows power status is unavailable".into()); }
-        let present = if p.flags == 255 { None } else { Some(p.flags & 128 == 0) };
-        let battery_percent = if present == Some(true) && p.percent <= 100 { Some(p.percent) } else { None };
-        let charging = if present == Some(true) && p.flags != 255 { Some(p.flags & 8 != 0) } else { None };
-        let remaining_seconds = if present == Some(true) && p.remaining != u32::MAX { Some(p.remaining) } else { None };
-        let mut flags = 0u32;
-        // This is a connection configuration indicator, not an Internet reachability test.
-        let connection_configured = Some(unsafe { InternetGetConnectedState(&mut flags, 0) } != 0);
+        let (mut present, mut battery_percent, mut charging, mut remaining_seconds) = (None, None, None, None);
+        if include_power {
+            let mut p = PowerStatus { ac: 255, flags: 255, percent: 255, saver: 0, remaining: u32::MAX, full: u32::MAX };
+            if unsafe { GetSystemPowerStatus(&mut p) } == 0 { return Err("Windows power status is unavailable".into()); }
+            present = if p.flags == 255 { None } else { Some(p.flags & 128 == 0) };
+            battery_percent = if present == Some(true) && p.percent <= 100 { Some(p.percent) } else { None };
+            charging = if present == Some(true) && p.flags != 255 { Some(p.flags & 8 != 0) } else { None };
+            remaining_seconds = if present == Some(true) && p.remaining != u32::MAX { Some(p.remaining) } else { None };
+        }
+        let connection_configured = if include_network {
+            let mut flags = 0u32;
+            // Configuration indicator only: this does not verify Internet reachability.
+            Some(unsafe { InternetGetConnectedState(&mut flags, 0) } != 0)
+        } else { None };
         Ok(SystemStatus { battery_present: present, battery_percent, charging, remaining_seconds, connection_configured })
     }
-    #[cfg(not(windows))] { Err("Windows is required".into()) }
+    #[cfg(not(windows))] { let _ = (include_power, include_network); Err("Windows is required".into()) }
 }
