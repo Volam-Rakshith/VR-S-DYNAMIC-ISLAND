@@ -81,29 +81,52 @@ async fn resume_if_unchanged(paused: PausedSession) {
     if same && is_paused { if let Ok(op) = paused.session.TryPlayAsync() { let _ = op.await; } }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlarmOutcome { warning: Option<String> }
+
 #[tauri::command]
-pub async fn play_timer_alarm(app: tauri::AppHandle, controller: tauri::State<'_, AlarmController>, sound: String) -> Result<(), String> {
-    if sound == "silent" { return Ok(()); }
+pub async fn play_timer_alarm(app: tauri::AppHandle, controller: tauri::State<'_, AlarmController>, sound: String) -> Result<AlarmOutcome, String> {
+    if sound == "silent" { return Ok(AlarmOutcome { warning: None }); }
     let generation = {
         let mut state = controller.inner.lock().map_err(|_| "Alarm state unavailable")?;
-        if state.active { return Ok(()); }
+        if state.active { return Ok(AlarmOutcome { warning: None }); }
         state.generation = state.generation.wrapping_add(1); state.active = true; state.generation
     };
     #[cfg(windows)] {
         use windows::Media::Control::{GlobalSystemMediaTransportControlsSessionManager as Manager, GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status};
         let mut paused = None;
+        let mut warning = None;
         if let Ok(op) = Manager::RequestAsync() {
             if let Ok(manager) = op.await {
                 if let Ok(session) = manager.GetCurrentSession() {
-                    let info = session.GetPlaybackInfo();
-                    let eligible = info.as_ref().ok().and_then(|i| i.PlaybackStatus().ok()).map(|s| s == Status::Playing).unwrap_or(false)
-                        && info.as_ref().ok().and_then(|i| i.Controls().ok()).map(|c| c.IsPauseEnabled().unwrap_or(false) && c.IsPlayEnabled().unwrap_or(false)).unwrap_or(false);
-                    if eligible {
+                    let is_playing = session.GetPlaybackInfo().and_then(|i| i.PlaybackStatus()).map(|s| s == Status::Playing).unwrap_or(false);
+                    if is_playing {
+                        // Do not require IsPlayEnabled while already playing: many players
+                        // disable Play until after they have paused.
                         if let (Ok(source), Ok(op)) = (session.SourceAppUserModelId(), session.TryGetMediaPropertiesAsync()) {
-                            if let Ok(props) = op.await { if let Ok(title) = props.Title() { if let Ok(op) = session.TryPauseAsync() {
-                                if op.await.unwrap_or(false) { paused = Some(PausedSession { session, source: source.to_string(), title: title.to_string() }); }
-                            } } }
+                            if let Ok(props) = op.await {
+                                if let Ok(title) = props.Title() {
+                                    let mut accepted = match session.TryPauseAsync() { Ok(op) => op.await.unwrap_or(false), Err(_) => false };
+                                    if !accepted {
+                                        let can_toggle = session.GetPlaybackInfo().and_then(|i| i.Controls()).and_then(|c| c.IsPlayPauseToggleEnabled()).unwrap_or(false);
+                                        if can_toggle { accepted = match session.TryTogglePlayPauseAsync() { Ok(op) => op.await.unwrap_or(false), Err(_) => false }; }
+                                    }
+                                    if accepted {
+                                        // The return value means the request was accepted, not
+                                        // that the player has already stopped emitting audio.
+                                        let mut confirmed = false;
+                                        for _ in 0..10 {
+                                            if session.GetPlaybackInfo().and_then(|i| i.PlaybackStatus()).map(|v| v == Status::Paused).unwrap_or(false) { confirmed = true; break; }
+                                            let _ = tauri::async_runtime::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(100))).await;
+                                        }
+                                        if !confirmed { warning = Some("The player accepted pause but did not confirm it; music may overlap the alarm.".to_string()); }
+                                        paused = Some(PausedSession { session, source: source.to_string(), title: title.to_string() });
+                                    }
+                                }
+                            }
                         }
+                        if paused.is_none() { warning = Some("Windows could not pause the active player; music may overlap the alarm.".to_string()); }
                     }
                 }
             }
@@ -122,9 +145,9 @@ pub async fn play_timer_alarm(app: tauri::AppHandle, controller: tauri::State<'_
             }
         };
         if let Some(session) = paused { resume_if_unchanged(session).await; }
-        if cancelled { return Ok(()); }
+        if cancelled { return Ok(AlarmOutcome { warning: None }); }
         if let Some(error) = failed { return Err(error); }
-        Ok(())
+        Ok(AlarmOutcome { warning })
     }
     #[cfg(not(windows))] { let _ = (app, sound, generation); Err("Windows is required".into()) }
 }

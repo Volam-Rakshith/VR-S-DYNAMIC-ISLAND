@@ -52,3 +52,4 @@
 .panel{background:var(--bg)}.card,.settings-card,.extra-timers{background:var(--surface)}
 .shell.glass{--bg:#172033}
 .sound-preview:disabled{opacity:.4;cursor:not-allowed}
+button.compact-alert-icon{background:transparent;border:0;cursor:pointer}button.compact-alert-icon:focus-visible{outline:2px solid var(--accent)}
